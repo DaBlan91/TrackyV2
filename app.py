@@ -1,382 +1,593 @@
+# Streamlit DEGIRO Portfolio Tracker (v1.1 - DEGIRO-match)
+# Uploads:
+# 1) Account.csv (DEGIRO account overview) - optional in v1.1, mainly for validation/links
+# 2) Portfolio.csv (DEGIRO portfolio overview) - current quantities/prices/values
+# 3) Optional: "UI/Tracky export" CSV that already contains DEGIRO-like metrics per ISIN (gak, unrealized, total, dividend, etc.)
+#
+# Goal of v1.1:
+# - Match DEGIRO UI as close as possible.
+# - If UI/Tracky export is provided, we use it as the source for GAK and performance columns (best match).
+# - Portfolio.csv is used as source of "current snapshot" (qty/price/value). If both are present, Portfolio wins for "now".
+#
+# Notes:
+# - Pure Account.csv allocation of dividends/taxes to ISIN is not always possible because DEGIRO's FX legs can be unlinked.
+#   That is why the optional UI/Tracky export is supported for a true DEGIRO-match.
 
+import io
 import re
 from dataclasses import dataclass
-from typing import Optional, Dict, Tuple, List
+from typing import Optional, Tuple, Dict
 
+import numpy as np
 import pandas as pd
 import streamlit as st
 
-st.set_page_config(page_title="DEGIRO Portfolio Tracker (v1)", layout="wide")
+
+st.set_page_config(page_title="DEGIRO Portfolio Tracker (v1.1)", layout="wide")
+
 
 # -----------------------------
 # Helpers
 # -----------------------------
-ISIN_RE = re.compile(r"\b[A-Z]{2}[A-Z0-9]{10}\b")
-
-def parse_eu_number(x) -> float:
-    """Parse numbers like '1.234,56' or '-3,00' or '0,00' or NaN into float."""
-    if x is None or (isinstance(x, float) and pd.isna(x)):
-        return 0.0
+def _to_float_eu(x) -> float:
+    """Parse numbers like '1.234,56' or '123,45' or '123.45' into float."""
+    if x is None or (isinstance(x, float) and np.isnan(x)):
+        return np.nan
     s = str(x).strip()
-    if s == "" or s.lower() == "nan":
-        return 0.0
-    # Remove thousands separators and convert comma decimal
-    s = s.replace(".", "").replace(",", ".")
+    if s == "" or s.lower() in {"nan", "none"}:
+        return np.nan
+    # Remove currency symbols and spaces
+    s = re.sub(r"[€$]", "", s).strip()
+    # Handle thousands separators: if both '.' and ',' exist, assume EU style '1.234,56'
+    if "." in s and "," in s:
+        s = s.replace(".", "").replace(",", ".")
+    else:
+        # If only comma exists, treat comma as decimal separator
+        if "," in s and "." not in s:
+            s = s.replace(",", ".")
+    # Remove any remaining non-numeric except minus and dot
+    s = re.sub(r"[^0-9\.\-]", "", s)
     try:
         return float(s)
     except ValueError:
-        return 0.0
+        return np.nan
 
-def extract_isin(val: Optional[str]) -> Optional[str]:
-    if val is None or (isinstance(val, float) and pd.isna(val)):
-        return None
-    m = ISIN_RE.search(str(val))
-    return m.group(0) if m else None
 
-def parse_trade_desc(desc: str) -> Optional[Tuple[str, float, Optional[float], Optional[str]]]:
-    """
-    Parse 'Koop 3 @ 111,72 EUR' or 'Verkoop 150 @ 2,08 USD'
-    Returns (side, qty, price, ccy)
-    """
-    if not isinstance(desc, str):
-        return None
-    desc = desc.strip()
-    m = re.match(r"^(Koop|Verkoop)\s+([0-9]+(?:[.,][0-9]+)?)\s+@\s+([0-9]+(?:[.,][0-9]+)?)\s+([A-Z]{3})", desc)
-    if not m:
-        return None
-    side = "BUY" if m.group(1) == "Koop" else "SELL"
-    qty = parse_eu_number(m.group(2))
-    price = parse_eu_number(m.group(3))
-    ccy = m.group(4)
-    return side, qty, price, ccy
+def _norm_isin(x: str) -> str:
+    if x is None or (isinstance(x, float) and np.isnan(x)):
+        return ""
+    return str(x).strip().upper()
 
-def safe_to_datetime(d: str, t: str) -> pd.Timestamp:
-    # DEGIRO export: 'DD-MM-YYYY' + 'HH:MM'
-    try:
-        return pd.to_datetime(f"{d} {t}", format="%d-%m-%Y %H:%M")
-    except Exception:
+
+def _looks_like_isin(s: str) -> bool:
+    s = _norm_isin(s)
+    return bool(re.fullmatch(r"[A-Z0-9]{12}", s))
+
+
+def _safe_read_csv(uploaded_file) -> pd.DataFrame:
+    """Try common delimiters/encodings."""
+    raw = uploaded_file.getvalue()
+    # Try UTF-8 then latin-1
+    for enc in ("utf-8", "utf-8-sig", "latin-1"):
         try:
-            return pd.to_datetime(d, dayfirst=True)
+            text = raw.decode(enc)
+            break
         except Exception:
-            return pd.NaT
+            text = None
+    if text is None:
+        text = raw.decode("latin-1", errors="ignore")
+
+    # Try separators
+    for sep in (",", ";", "\t"):
+        try:
+            df = pd.read_csv(io.StringIO(text), sep=sep)
+            if df.shape[1] >= 2:
+                return df
+        except Exception:
+            continue
+    # Last resort
+    return pd.read_csv(io.StringIO(text))
+
 
 # -----------------------------
-# Parsing DEGIRO exports
+# Parsers
 # -----------------------------
-def load_account_csv(file) -> pd.DataFrame:
-    df = pd.read_csv(file)
+def parse_portfolio_csv(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Expected (common DEGIRO Portfolio export - NL):
+      Product, Symbool/ISIN, Aantal, Slotkoers, Lokale waarde, <currency col>, Waarde in EUR
 
-    # Normalize expected columns (DEGIRO NL exports often have these):
-    expected = {"Datum","Tijd","Product","ISIN","Omschrijving","Mutatie","Order Id"}
-    missing = expected - set(df.columns)
-    if missing:
-        raise ValueError(f"Account.csv mist kolommen: {', '.join(sorted(missing))}")
+    Returns normalized columns:
+      isin, product, qty_now, price_now, value_eur, currency
+    """
+    df = df.copy()
+    # normalize column names
+    cols = {c: c.strip() for c in df.columns}
+    df.rename(columns=cols, inplace=True)
 
-    # Amount and currency columns are weird in DEGIRO exports:
-    # 'Mutatie' usually contains the currency code, and the amount is in the next unnamed column.
-    # We'll detect the first 'Unnamed' column after Mutatie; in your sample it's 'Unnamed: 8'.
-    unnamed_cols = [c for c in df.columns if c.lower().startswith("unnamed")]
-    # Prefer the first unnamed column as amount column
-    amount_col = unnamed_cols[0] if unnamed_cols else None
-    if amount_col is None:
-        raise ValueError("Kan mutatie-bedragen niet vinden (geen 'Unnamed' kolom).")
+    # Try to detect
+    col_product = next((c for c in df.columns if c.lower() in {"product"}), None)
+    col_isin = next((c for c in df.columns if "isin" in c.lower()), None)  # often 'Symbool/ISIN'
+    col_qty = next((c for c in df.columns if c.lower() in {"aantal", "qty", "quantity"}), None)
+    col_price = next((c for c in df.columns if c.lower() in {"slotkoers", "koers", "price"}), None)
+    col_value_eur = next((c for c in df.columns if "waarde" in c.lower() and "eur" in c.lower()), None)
 
-    df = df.rename(columns={
-        "Mutatie": "mut_ccy",
-        amount_col: "mut_amount_raw",
-        "Order Id": "order_id",
-        "Omschrijving": "description",
-        "Product": "product",
-        "ISIN": "isin",
-        "Datum": "date",
-        "Tijd": "time"
-    })
-
-    df["mut_amount"] = df["mut_amount_raw"].apply(parse_eu_number)
-    df["isin"] = df["isin"].apply(extract_isin)
-    df["ts"] = [safe_to_datetime(d, t) for d, t in zip(df["date"].astype(str), df["time"].astype(str))]
-    return df
-
-def load_portfolio_csv(file) -> pd.DataFrame:
-    df = pd.read_csv(file)
-
-    # Expected columns from your sample:
-    # Product, Symbool/ISIN, Aantal, Slotkoers, Waarde in EUR
-    required_any = {"Product", "Symbool/ISIN", "Aantal"}
-    if not required_any.issubset(df.columns):
-        raise ValueError("Portfolio.csv mist minimaal: Product, Symbool/ISIN, Aantal")
-
-    # Identify EUR value column
-    eur_value_col = None
+    # Currency: sometimes unnamed column with values EUR/USD next to local value
+    col_currency = None
     for c in df.columns:
-        if str(c).strip().lower() in ["waarde in eur", "waarde in EUR".lower()]:
-            eur_value_col = c
-            break
-    if eur_value_col is None and "Waarde in EUR" in df.columns:
-        eur_value_col = "Waarde in EUR"
-    if eur_value_col is None:
-        # Try fuzzy
-        for c in df.columns:
-            if "eur" in str(c).lower() and "waarde" in str(c).lower():
-                eur_value_col = c
-                break
-    if eur_value_col is None:
-        raise ValueError("Portfolio.csv: kan 'Waarde in EUR' kolom niet vinden.")
-
-    # Identify price column (optional)
-    price_col = None
-    for c in df.columns:
-        if str(c).strip().lower() in ["slotkoers", "laatste koers", "koers", "price", "last price"]:
-            price_col = c
+        if "valuta" in c.lower():
+            col_currency = c
             break
 
-    df = df.rename(columns={
-        "Product": "product",
-        "Symbool/ISIN": "symbol_isin",
-        "Aantal": "qty_now_raw",
-        eur_value_col: "value_eur_raw",
+    if col_product is None or col_isin is None or col_qty is None or col_price is None or col_value_eur is None:
+        raise ValueError("Kon Portfolio.csv kolommen niet herkennen. Verwacht o.a. Product, Symbool/ISIN, Aantal, Slotkoers, Waarde in EUR.")
+
+    out = pd.DataFrame({
+        "product": df[col_product].astype(str).fillna(""),
+        "isin": df[col_isin].apply(_norm_isin),
+        "qty_now": df[col_qty].apply(_to_float_eu),
+        "price_now": df[col_price].apply(_to_float_eu),
+        "value_eur": df[col_value_eur].apply(_to_float_eu),
     })
-    if price_col:
-        df = df.rename(columns={price_col: "price_now_raw"})
+
+    # drop cash rows without ISIN
+    out = out[out["isin"].apply(_looks_like_isin)].copy()
+
+    if col_currency:
+        out["currency"] = df[col_currency].astype(str).str.strip().replace({"nan": ""})
     else:
-        df["price_now_raw"] = None
+        # heuristic: if there is a column with exactly EUR/USD values
+        currency_guess = None
+        for c in df.columns:
+            vals = set(df[c].dropna().astype(str).str.strip().unique().tolist())
+            if vals.issubset({"EUR", "USD", "GBP", "CHF", "DKK", "SEK"}) and len(vals) > 0:
+                currency_guess = c
+                break
+        if currency_guess:
+            out["currency"] = df[currency_guess].astype(str).str.strip()
+        else:
+            out["currency"] = ""
 
-    df["isin"] = df["symbol_isin"].apply(extract_isin)
-    df["qty_now"] = df["qty_now_raw"].apply(parse_eu_number)
-    df["value_eur"] = df["value_eur_raw"].apply(parse_eu_number)
-    df["price_now"] = df["price_now_raw"].apply(parse_eu_number) if "price_now_raw" in df.columns else 0.0
+    return out
 
-    # Keep only rows that look like securities (exclude CASH lines without ISIN)
-    df = df[df["isin"].notna()].copy()
-    return df[["isin","product","qty_now","price_now","value_eur"]]
+
+def parse_ui_export_csv(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Supports a 'UI/Tracky export' shaped like:
+      product, isin, qty_now, price_now, value_eur, gak_eur, cost_eur, unrealized_eur, unrealized_pct,
+      realized_eur, dividend_eur, withholding_tax_eur, total_return_eur, total_return_pct
+
+    Returns those normalized columns (isin as key).
+    """
+    df = df.copy()
+    df.columns = [c.strip().lower() for c in df.columns]
+
+    required = {"isin", "value_eur", "gak_eur", "cost_eur", "unrealized_eur", "total_return_eur"}
+    if not required.issubset(set(df.columns)):
+        raise ValueError("Kon UI/Tracky export niet herkennen. Verwacht kolommen zoals: isin, value_eur, gak_eur, cost_eur, unrealized_eur, total_return_eur...")
+
+    out = pd.DataFrame()
+    out["isin"] = df["isin"].apply(_norm_isin)
+    out["product"] = df["product"] if "product" in df.columns else ""
+    for col in ["qty_now", "price_now", "value_eur", "gak_eur", "cost_eur",
+                "unrealized_eur", "unrealized_pct", "realized_eur",
+                "dividend_eur", "withholding_tax_eur",
+                "total_return_eur", "total_return_pct"]:
+        if col in df.columns:
+            out[col] = df[col].apply(_to_float_eu)
+        else:
+            out[col] = np.nan
+
+    out = out[out["isin"].apply(_looks_like_isin)].copy()
+    return out
+
+
+def parse_account_csv(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Basic parser for Account.csv. In v1.1 we mainly use it for:
+    - sanity checks, and
+    - (optional) realized P/L from trades when no UI export is provided (limited dividend allocation).
+    """
+    df = df.copy()
+    df.columns = [c.strip() for c in df.columns]
+
+    needed = {"Datum", "Omschrijving", "Mutatie"}
+    if not needed.issubset(set(df.columns)):
+        raise ValueError("Kon Account.csv niet herkennen. Verwacht kolommen zoals: Datum, Omschrijving, Mutatie, Product, ISIN, Order Id.")
+
+    # Amount column in many DEGIRO NL exports is unnamed 'Unnamed: 8'
+    amt_col = None
+    for c in df.columns:
+        if c.lower().startswith("unnamed") and "8" in c:
+            amt_col = c
+            break
+    if amt_col is None:
+        # fallback: find numeric-like column besides Mutatie/Saldo
+        candidates = [c for c in df.columns if c not in {"Datum", "Tijd", "Valutadatum", "Product", "ISIN", "Omschrijving", "FX", "Mutatie", "Saldo", "Order Id"}]
+        amt_col = candidates[0] if candidates else None
+    if amt_col is None:
+        raise ValueError("Kon bedrag-kolom in Account.csv niet vinden (meestal 'Unnamed: 8').")
+
+    out = pd.DataFrame({
+        "date": df["Datum"].astype(str),
+        "time": df["Tijd"].astype(str) if "Tijd" in df.columns else "",
+        "product": df["Product"].astype(str) if "Product" in df.columns else "",
+        "isin": df["ISIN"].apply(_norm_isin) if "ISIN" in df.columns else "",
+        "desc": df["Omschrijving"].astype(str),
+        "ccy": df["Mutatie"].astype(str).str.strip(),
+        "amount": df[amt_col].apply(_to_float_eu),
+        "order_id": df["Order Id"].astype(str) if "Order Id" in df.columns else "",
+        "fx": df["FX"].apply(_to_float_eu) if "FX" in df.columns else np.nan
+    })
+    out["order_id"] = out["order_id"].replace({"nan": ""})
+    return out
+
 
 # -----------------------------
-# Core calculations
+# Calculations (fallback)
 # -----------------------------
 @dataclass
-class PositionState:
-    qty: float = 0.0
-    cost_eur: float = 0.0  # open cost basis in EUR
-    realized_eur: float = 0.0
+class PositionCalc:
+    isin: str
+    product: str
+    qty: float
+    cost_eur: float
+    gak_eur: float
+    realized_eur: float
+    fees_eur: float
 
-def build_orders(account_df: pd.DataFrame) -> pd.DataFrame:
+
+def compute_from_account_only(acc: pd.DataFrame) -> pd.DataFrame:
     """
-    Build order-level table:
-    - side BUY/SELL
-    - qty
-    - eur_cash (net cash movement in EUR within the same order_id)
+    Fallback computation (best effort) when UI export is not provided.
+    Computes:
+      - cost basis and GAK using average cost method
+      - realized P/L
+      - fees allocated via 'DEGIRO Transactiekosten...' rows linked by Order Id
+    Dividend/tax allocation in EUR can be incomplete if FX legs are not linked to ISIN.
     """
-    df = account_df.copy()
-    df = df[df["order_id"].notna()].copy()
+    acc = acc.copy()
+    # Identify trades: desc starts with Koop/Verkoop and includes '@'
+    is_trade = acc["desc"].str.startswith(("Koop", "Verkoop"))
+    trades = acc[is_trade].copy()
 
-    if df.empty:
-        return pd.DataFrame(columns=["ts","isin","product","side","qty","eur_cash"])
+    # Parse qty and trade currency price from desc: "Koop 2 @ 71,16 USD"
+    def parse_trade_desc(s: str) -> Tuple[str, float, float, str]:
+        # returns side, qty, price, ccy
+        m = re.match(r"^(Koop|Verkoop)\s+([0-9]+)\s+@\s+([0-9\.,]+)\s+([A-Z]{3})", s.strip())
+        if not m:
+            return "", np.nan, np.nan, ""
+        side = "BUY" if m.group(1) == "Koop" else "SELL"
+        qty = float(m.group(2))
+        price = _to_float_eu(m.group(3))
+        ccy = m.group(4)
+        return side, qty, price, ccy
 
-    orders = []
-    for oid, g in df.groupby("order_id", dropna=True):
-        # Identify instrument
-        isin = g["isin"].dropna().astype(str).iloc[0] if g["isin"].notna().any() else None
-        product = g["product"].dropna().astype(str).iloc[0] if g["product"].notna().any() else None
+    parsed = trades["desc"].apply(parse_trade_desc)
+    trades["side"] = parsed.apply(lambda x: x[0])
+    trades["qty"] = parsed.apply(lambda x: x[1])
+    trades["price"] = parsed.apply(lambda x: x[2])
+    trades["trade_ccy"] = parsed.apply(lambda x: x[3])
 
-        # Identify trade rows (Koop/Verkoop) - sometimes multiple fills under same order id
-        trades = []
-        for desc in g["description"].dropna().astype(str).tolist():
-            parsed = parse_trade_desc(desc)
-            if parsed:
-                trades.append(parsed)
-        if not trades:
+    # For each Order ID, compute EUR cash impact:
+    # - For EUR trades: amount already in EUR (acc.amount where desc is trade and ccy=EUR)
+    # - For non-EUR trades: use the EUR leg "Valuta Debitering/Creditering" within same order_id
+    # - Add fees in EUR (fees rows linked by same order_id)
+    # Convention: acc.amount positive = credit, negative = debit.
+    # For BUY, cost_eur should be positive outflow => -EUR_debit (make positive).
+    # For SELL, proceeds_eur positive inflow => EUR_credit (positive).
+    oids = trades["order_id"].fillna("").astype(str).unique().tolist()
+
+    # fees by oid (EUR)
+    fees = acc[acc["desc"].str.contains("Transactiekosten", case=False, na=False)].copy()
+    fees_eur_by_oid = fees[fees["ccy"].eq("EUR")].groupby("order_id")["amount"].sum().to_dict()
+
+    # EUR legs by oid
+    eur_legs = acc[acc["ccy"].eq("EUR") & acc["desc"].isin(["Valuta Debitering", "Valuta Creditering"])].copy()
+    eur_leg_by_oid = eur_legs.groupby("order_id")["amount"].sum().to_dict()  # net EUR change from FX legs
+
+    # For EUR trades without FX legs, use trade row amount in EUR
+    trade_eur_amount_by_oid = trades[trades["ccy"].eq("EUR")].groupby("order_id")["amount"].sum().to_dict()
+
+    # Now compute per trade row eur_cash
+    def eur_cash_for_row(r):
+        oid = str(r["order_id"])
+        if r["trade_ccy"] == "EUR":
+            eur_amt = trade_eur_amount_by_oid.get(oid, np.nan)
+            if np.isnan(eur_amt):
+                eur_amt = r["amount"]
+        else:
+            eur_amt = eur_leg_by_oid.get(oid, np.nan)
+        fee = fees_eur_by_oid.get(oid, 0.0)
+        return eur_amt, fee
+
+    tmp = trades.apply(lambda r: eur_cash_for_row(r), axis=1, result_type="expand")
+    trades["eur_cash_net"] = tmp[0]  # net EUR change due to FX leg (BUY negative, SELL positive)
+    trades["fee_eur"] = tmp[1]
+
+    # If eur_cash_net is NaN, we can't compute; drop those (rare)
+    trades = trades.dropna(subset=["eur_cash_net"]).copy()
+
+    # Average cost per ISIN
+    positions: Dict[str, PositionCalc] = {}
+    for _, r in trades.sort_values(["date", "time"]).iterrows():
+        isin = _norm_isin(r["isin"])
+        if not _looks_like_isin(isin):
             continue
-
-        # Ensure consistent side
-        sides = {t[0] for t in trades}
-        if len(sides) != 1:
-            # Mixed side in one order id is unusual; skip safely
-            continue
-        side = list(sides)[0]
-        qty = sum(t[1] for t in trades)
-
-        # Net EUR cash movement within order
-        eur_cash = g.loc[g["mut_ccy"].astype(str).str.upper() == "EUR", "mut_amount"].sum()
-
-        # Timestamp: earliest timestamp in group
-        ts = g["ts"].dropna().min() if g["ts"].notna().any() else pd.NaT
-
-        orders.append({
-            "order_id": oid,
-            "ts": ts,
-            "isin": isin,
-            "product": product,
-            "side": side,
-            "qty": float(qty),
-            "eur_cash": float(eur_cash)
-        })
-
-    odf = pd.DataFrame(orders)
-    if not odf.empty:
-        odf = odf.sort_values("ts")
-    return odf
-
-def compute_positions_from_orders(order_df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Average-cost method:
-    - BUY: increase qty; increase cost by -eur_cash (eur_cash is negative outflow)
-    - SELL: decrease qty; realized += proceeds - cost_removed; cost -= cost_removed
-      proceeds = eur_cash (positive inflow, net of fees if fees are in EUR within order)
-    """
-    states: Dict[str, PositionState] = {}
-    for _, r in order_df.iterrows():
-        isin = r["isin"]
-        if not isin or pd.isna(isin):
-            continue
+        prod = r["product"]
         side = r["side"]
-        qty = float(r["qty"] or 0.0)
-        eur_cash = float(r["eur_cash"] or 0.0)
+        qty = float(r["qty"])
+        eur_cash = float(r["eur_cash_net"])
+        fee = float(r["fee_eur"])
+        # BUY: eur_cash negative => cost positive
+        if isin not in positions:
+            positions[isin] = PositionCalc(isin=isin, product=prod, qty=0.0, cost_eur=0.0, gak_eur=0.0, realized_eur=0.0, fees_eur=0.0)
 
-        stt = states.get(isin, PositionState())
-
+        p = positions[isin]
         if side == "BUY":
-            # Cash outflow (usually negative). Cost increase is positive.
-            cost_increase = -eur_cash
-            if cost_increase < 0:
-                # If EUR cash is unexpectedly positive, ignore rather than corrupt.
-                cost_increase = abs(cost_increase)
-            stt.qty += qty
-            stt.cost_eur += cost_increase
+            cost = -(eur_cash) + fee  # make positive
+            p.qty += qty
+            p.cost_eur += cost
+            p.fees_eur += fee
+            p.gak_eur = (p.cost_eur / p.qty) if p.qty > 0 else 0.0
+        else:  # SELL
+            proceeds = eur_cash  # positive
+            avg = (p.cost_eur / p.qty) if p.qty > 0 else 0.0
+            cost_sold = avg * qty
+            p.qty -= qty
+            p.cost_eur -= cost_sold
+            p.realized_eur += (proceeds - cost_sold - fee)
+            p.fees_eur += fee
+            p.gak_eur = (p.cost_eur / p.qty) if p.qty > 0 else 0.0
 
-        elif side == "SELL":
-            if stt.qty <= 0:
-                # Nothing to sell against (data issue); skip
-                continue
-            sell_qty = min(qty, stt.qty)
-            avg_cost = stt.cost_eur / stt.qty if stt.qty != 0 else 0.0
-            cost_removed = avg_cost * sell_qty
-            proceeds = eur_cash  # already net in EUR within this order
-            stt.qty -= sell_qty
-            stt.cost_eur -= cost_removed
-            stt.realized_eur += (proceeds - cost_removed)
+    out = pd.DataFrame([{
+        "isin": k,
+        "product": v.product,
+        "qty_calc": v.qty,
+        "cost_eur": v.cost_eur,
+        "gak_eur": v.gak_eur,
+        "realized_eur": v.realized_eur,
+        "fees_eur": v.fees_eur,
+    } for k, v in positions.items()])
 
-        states[isin] = stt
-
-    rows = []
-    for isin, stt in states.items():
-        gak = stt.cost_eur / stt.qty if stt.qty else 0.0
-        rows.append({
-            "isin": isin,
-            "qty_calc": stt.qty,
-            "cost_eur": stt.cost_eur,
-            "gak_eur": gak,
-            "realized_eur": stt.realized_eur
-        })
-    return pd.DataFrame(rows)
-
-def compute_dividends_eur(account_df: pd.DataFrame) -> pd.DataFrame:
-    """
-    v1: dividend EUR only (reliable without FX matching).
-    Includes:
-    - Dividend
-    - Kapitaalsuitkering
-    Excludes dividendbelasting (withholding) as separate column.
-    """
-    df = account_df.copy()
-    df["desc"] = df["description"].astype(str)
-
-    dividend_mask = df["desc"].isin(["Dividend", "Kapitaalsuitkering"])
-    tax_mask = df["desc"].isin(["Dividendbelasting"])
-
-    div = df[dividend_mask & (df["mut_ccy"].astype(str).str.upper() == "EUR") & df["isin"].notna()]
-    tax = df[tax_mask & (df["mut_ccy"].astype(str).str.upper() == "EUR") & df["isin"].notna()]
-
-    div_agg = div.groupby("isin")["mut_amount"].sum().rename("dividend_eur").reset_index()
-    tax_agg = tax.groupby("isin")["mut_amount"].sum().rename("withholding_tax_eur").reset_index()
-
-    out = pd.merge(div_agg, tax_agg, on="isin", how="outer").fillna(0.0)
     return out
+
 
 # -----------------------------
 # UI
 # -----------------------------
-st.title("DEGIRO Portfolio Tracker (v1)")
-st.caption("Upload je **Account.csv** (transacties) + **Portfolio.csv** (actuele posities/waarde). Geen API nodig.")
+st.title("DEGIRO Portfolio Tracker (v1.1 – DEGIRO-match)")
+st.caption("Upload je DEGIRO exports. Voor de beste match met DEGIRO UI: upload óók een UI/Tracky export met GAK en (on)gerealiseerde W/V per ISIN.")
 
-with st.sidebar:
-    st.header("Uploads")
-    account_file = st.file_uploader("Account.csv (transacties)", type=["csv"])
-    portfolio_file = st.file_uploader("Portfolio.csv (actuele posities)", type=["csv"])
+colA, colB, colC = st.columns(3)
+with colA:
+    up_account = st.file_uploader("Upload Account.csv (DEGIRO – rekeningoverzicht)", type=["csv"], key="acc")
+with colB:
+    up_portfolio = st.file_uploader("Upload Portfolio.csv (DEGIRO – portefeuille)", type=["csv"], key="port")
+with colC:
+    up_ui = st.file_uploader("Optioneel: UI/Tracky export (met GAK & W/V per ISIN)", type=["csv"], key="ui")
 
-    st.divider()
-    st.subheader("Opties")
-    show_debug = st.checkbox("Toon debug / checks", value=False)
+st.divider()
 
-if not account_file or not portfolio_file:
-    st.info("Upload beide bestanden om te starten.")
+if not up_portfolio and not up_ui:
+    st.info("Upload minimaal **Portfolio.csv** (voor actuele waarde) of een **UI/Tracky export** (die al actuele waarde + resultaten bevat).")
     st.stop()
 
-# Load
+# Read & parse
+portfolio_df = None
+ui_df = None
+account_df = None
+
+errors = []
+
 try:
-    acc = load_account_csv(account_file)
-    port = load_portfolio_csv(portfolio_file)
+    if up_portfolio:
+        portfolio_raw = _safe_read_csv(up_portfolio)
+        portfolio_df = parse_portfolio_csv(portfolio_raw)
 except Exception as e:
-    st.error(f"Kan bestanden niet inlezen: {e}")
+    errors.append(f"Portfolio.csv: {e}")
+
+try:
+    if up_ui:
+        ui_raw = _safe_read_csv(up_ui)
+        ui_df = parse_ui_export_csv(ui_raw)
+except Exception as e:
+    errors.append(f"UI/Tracky export: {e}")
+
+try:
+    if up_account:
+        acc_raw = _safe_read_csv(up_account)
+        account_df = parse_account_csv(acc_raw)
+except Exception as e:
+    errors.append(f"Account.csv: {e}")
+
+if errors:
+    st.error("Er gingen dingen mis bij het inlezen:\n\n- " + "\n- ".join(errors))
     st.stop()
 
-# Build orders and compute
-orders = build_orders(acc)
-pos_calc = compute_positions_from_orders(orders)
-divs = compute_dividends_eur(acc)
+# Build base table
+if ui_df is not None:
+    base = ui_df.copy()
+else:
+    # fallback: compute from account only + merge portfolio snapshot
+    if account_df is None:
+        st.error("Zonder UI/Tracky export heb je **Account.csv** nodig om GAK/kostbasis te berekenen.")
+        st.stop()
+    calc = compute_from_account_only(account_df)
+    base = calc.rename(columns={"qty_calc": "qty_now"}).copy()
+    base["price_now"] = np.nan
+    base["value_eur"] = np.nan
+    base["unrealized_eur"] = np.nan
+    base["unrealized_pct"] = np.nan
+    base["dividend_eur"] = 0.0
+    base["withholding_tax_eur"] = 0.0
+    base["total_return_eur"] = np.nan
+    base["total_return_pct"] = np.nan
+    base["realized_eur"] = base["realized_eur"].fillna(0.0)
 
-# Merge with portfolio (current snapshot is leading for 'now')
-df = port.merge(pos_calc, on="isin", how="left").merge(divs, on="isin", how="left")
-df[["cost_eur","gak_eur","realized_eur","dividend_eur","withholding_tax_eur"]] = df[["cost_eur","gak_eur","realized_eur","dividend_eur","withholding_tax_eur"]].fillna(0.0)
+# Merge portfolio snapshot to get accurate "now"
+if portfolio_df is not None:
+    snap = portfolio_df[["isin", "product", "qty_now", "price_now", "value_eur", "currency"]].copy()
+    out = base.merge(snap, on="isin", how="outer", suffixes=("_base", ""))
+    # Choose product name
+    out["product"] = out["product"].where(out["product"].astype(str).str.len() > 0, out.get("product_base", ""))
+    # If base had qty_now scaled (e.g., *10) and portfolio has smaller, auto-correct scale
+    if "qty_now_base" in out.columns:
+        # Determine scaling per row
+        q_base = out["qty_now_base"]
+        q_snap = out["qty_now"]
+        scale_fix = (q_base.notna() & q_snap.notna() & (q_base > 0) & (q_snap > 0) & (np.isclose(q_base / q_snap, 10.0, atol=1e-6)))
+        # If scale_fix, overwrite base-derived quantities and cost basis scaling accordingly
+        out["scale_fix_10x"] = scale_fix
+        # Prefer portfolio quantities always (DEGIRO truth)
+        out["qty_now_final"] = out["qty_now"]
+        # If we used base for cost and it's based on scaled qty, fix cost basis per share? In UI export cost_eur is correct, so do not change.
+        # If cost_eur is NaN (unlikely), keep.
+    else:
+        out["qty_now_final"] = out["qty_now"]
 
-# Business rule: current qty/value come from Portfolio.csv
-df["unrealized_eur"] = df["value_eur"] - df["cost_eur"]
-df["unrealized_pct"] = df.apply(lambda r: (r["unrealized_eur"]/r["cost_eur"]*100.0) if r["cost_eur"] else 0.0, axis=1)
+    # Overwrite price/value with snapshot when present
+    out["price_now_final"] = out["price_now"].where(out["price_now"].notna(), out.get("price_now_base", np.nan))
+    out["value_eur_final"] = out["value_eur"].where(out["value_eur"].notna(), out.get("value_eur_base", np.nan))
 
-df["total_return_eur"] = df["unrealized_eur"] + df["realized_eur"] + df["dividend_eur"] + df["withholding_tax_eur"]
-df["total_return_pct"] = df.apply(lambda r: (r["total_return_eur"]/r["cost_eur"]*100.0) if r["cost_eur"] else 0.0, axis=1)
+else:
+    out = base.copy()
+    out["qty_now_final"] = out["qty_now"]
+    out["price_now_final"] = out["price_now"]
+    out["value_eur_final"] = out["value_eur"]
+    out["currency"] = ""
 
-# Summary metrics
-total_value = float(df["value_eur"].sum())
-total_cost = float(df["cost_eur"].sum())
-total_unreal = float(df["unrealized_eur"].sum())
-total_realized = float(df["realized_eur"].sum())
-total_div = float(df["dividend_eur"].sum() + df["withholding_tax_eur"].sum())
-total_return = float(total_unreal + total_realized + total_div)
+# Final calculations for DEGIRO-like columns
+out["cost_eur"] = out.get("cost_eur", np.nan)
+out["gak_eur"] = out.get("gak_eur", np.nan)
 
-col1, col2, col3, col4 = st.columns(4)
-col1.metric("Totale waarde (EUR)", f"€ {total_value:,.2f}")
-col2.metric("Kostbasis open posities (EUR)", f"€ {total_cost:,.2f}")
-col3.metric("Ongerealiseerd resultaat (EUR)", f"€ {total_unreal:,.2f}", delta=f"{(total_unreal/total_cost*100.0 if total_cost else 0.0):.2f}%")
-col4.metric("Totaal rendement (EUR)", f"€ {total_return:,.2f}")
+# If GAK missing but we have cost and qty, compute
+mask_gak = out["gak_eur"].isna() & out["cost_eur"].notna() & (out["qty_now_final"] > 0)
+out.loc[mask_gak, "gak_eur"] = out.loc[mask_gak, "cost_eur"] / out.loc[mask_gak, "qty_now_final"]
 
-# Table
-st.subheader("Posities")
-display_cols = [
-    "product","isin","qty_now","price_now","value_eur",
-    "gak_eur","cost_eur","unrealized_eur","unrealized_pct",
-    "realized_eur","dividend_eur","withholding_tax_eur",
-    "total_return_eur","total_return_pct"
-]
-pretty = df.copy()
-pretty = pretty[display_cols].sort_values("value_eur", ascending=False)
+# Unrealized from snapshot value and GAK
+out["unrealized_eur_calc"] = out["value_eur_final"] - (out["gak_eur"].fillna(0.0) * out["qty_now_final"].fillna(0.0))
+out["unrealized_pct_calc"] = np.where(
+    out["cost_eur"].fillna(0.0) != 0,
+    (out["unrealized_eur_calc"] / out["cost_eur"]) * 100.0,
+    np.nan
+)
 
-# Format
-st.dataframe(pretty, use_container_width=True, hide_index=True)
+# If UI export provided unrealized values, keep those for best match; else use calculated
+if "unrealized_eur" in out.columns and out["unrealized_eur"].notna().any():
+    out["unrealized_eur_final"] = out["unrealized_eur"]
+    out["unrealized_pct_final"] = out["unrealized_pct"]
+else:
+    out["unrealized_eur_final"] = out["unrealized_eur_calc"]
+    out["unrealized_pct_final"] = out["unrealized_pct_calc"]
 
-# Downloads
-csv_out = pretty.to_csv(index=False).encode("utf-8")
-st.download_button("Download posities (CSV)", data=csv_out, file_name="positions_calculated.csv", mime="text/csv")
+# Total return: prefer provided, else compute = unrealized + realized + dividend + withholding_tax
+out["realized_eur"] = out.get("realized_eur", 0.0).fillna(0.0)
+out["dividend_eur"] = out.get("dividend_eur", 0.0).fillna(0.0)
+out["withholding_tax_eur"] = out.get("withholding_tax_eur", 0.0).fillna(0.0)
 
-if show_debug:
-    st.subheader("Debug")
-    st.write("Account.csv rows:", len(acc), "Portfolio.csv rows:", len(port))
-    st.write("Order rows parsed:", len(orders))
-    st.dataframe(orders.head(50), use_container_width=True)
-    # Show instruments where qty mismatch between calc and portfolio
-    merged = df.copy()
-    merged["qty_diff"] = merged["qty_now"] - merged["qty_calc"].fillna(0.0)
-    mism = merged[merged["qty_diff"].abs() > 1e-9][["product","isin","qty_now","qty_calc","qty_diff"]].sort_values("qty_diff", key=lambda s: s.abs(), ascending=False)
-    st.write("Qty verschillen (Portfolio vs berekend uit orders):")
-    st.dataframe(mism, use_container_width=True, hide_index=True)
+if "total_return_eur" in out.columns and out["total_return_eur"].notna().any():
+    out["total_return_eur_final"] = out["total_return_eur"]
+    out["total_return_pct_final"] = out["total_return_pct"]
+else:
+    out["total_return_eur_final"] = out["unrealized_eur_final"] + out["realized_eur"] + out["dividend_eur"] + out["withholding_tax_eur"]
+    out["total_return_pct_final"] = np.where(
+        out["cost_eur"].fillna(0.0) != 0,
+        (out["total_return_eur_final"] / out["cost_eur"]) * 100.0,
+        np.nan
+    )
 
-st.caption("v1: gebruikt **Portfolio.csv** als waarheid voor actuele waarde/aantal. Kostbasis & GAK worden berekend uit orderregels in Account.csv via netto EUR cashflow per Order Id.")
+# Display formatting
+def fmt_eur(x):
+    if pd.isna(x):
+        return ""
+    return f"{x:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+
+def fmt_pct(x):
+    if pd.isna(x):
+        return ""
+    return f"{x:.2f}%".replace(".", ",")
+
+show = pd.DataFrame({
+    "Product": out["product"].fillna(""),
+    "ISIN": out["isin"],
+    "Aantal": out["qty_now_final"],
+    "Koers": out["price_now_final"],
+    "Valuta": out["currency"].fillna(""),
+    "Waarde (EUR)": out["value_eur_final"],
+    "GAK (EUR)": out["gak_eur"],
+    "Ongerealiseerd W/V €": out["unrealized_eur_final"],
+    "Ongerealiseerd W/V %": out["unrealized_pct_final"],
+    "Dividend €": out["dividend_eur"],
+    "Bronbelasting €": out["withholding_tax_eur"],
+    "Gerealiseerd €": out["realized_eur"],
+    "Totale W/V €": out["total_return_eur_final"],
+    "Totale W/V %": out["total_return_pct_final"],
+})
+
+# Summary KPIs
+total_value = np.nansum(show["Waarde (EUR)"].values.astype(float))
+total_cost = np.nansum(out["cost_eur"].fillna(0.0).values.astype(float))
+total_unreal = np.nansum(show["Ongerealiseerd W/V €"].fillna(0.0).values.astype(float))
+total_total = np.nansum(show["Totale W/V €"].fillna(0.0).values.astype(float))
+
+k1, k2, k3, k4 = st.columns(4)
+k1.metric("Totale waarde (EUR)", fmt_eur(total_value))
+k2.metric("Totale kostbasis (EUR)", fmt_eur(total_cost))
+k3.metric("Ongerealiseerd (EUR)", fmt_eur(total_unreal))
+k4.metric("Totale W/V (EUR)", fmt_eur(total_total))
+
+st.divider()
+
+# Filters
+c1, c2 = st.columns([2,1])
+with c1:
+    q = st.text_input("Zoek (product/ISIN)", "")
+with c2:
+    only_open = st.checkbox("Alleen open posities (waarde > 0)", value=True)
+
+tbl = show.copy()
+if only_open:
+    tbl = tbl[tbl["Waarde (EUR)"].fillna(0.0) != 0.0]
+if q.strip():
+    qq = q.strip().lower()
+    tbl = tbl[
+        tbl["Product"].str.lower().str.contains(qq, na=False)
+        | tbl["ISIN"].str.lower().str.contains(qq, na=False)
+    ]
+
+# Sort: largest value
+tbl = tbl.sort_values("Waarde (EUR)", ascending=False)
+
+# Pretty display
+display_tbl = tbl.copy()
+for c in ["Waarde (EUR)", "GAK (EUR)", "Ongerealiseerd W/V €", "Dividend €", "Bronbelasting €", "Gerealiseerd €", "Totale W/V €"]:
+    display_tbl[c] = display_tbl[c].apply(fmt_eur)
+for c in ["Ongerealiseerd W/V %", "Totale W/V %"]:
+    display_tbl[c] = display_tbl[c].apply(fmt_pct)
+display_tbl["Aantal"] = display_tbl["Aantal"].apply(lambda x: "" if pd.isna(x) else (str(int(x)) if float(x).is_integer() else str(x)))
+display_tbl["Koers"] = display_tbl["Koers"].apply(lambda x: "" if pd.isna(x) else f"{x:.4f}".rstrip("0").rstrip(".").replace(".", ","))
+
+st.dataframe(display_tbl, use_container_width=True, hide_index=True)
+
+st.divider()
+
+with st.expander("Debug / checks"):
+    st.write("Upload-status:")
+    st.write({
+        "account.csv": bool(up_account),
+        "portfolio.csv": bool(up_portfolio),
+        "ui_export.csv": bool(up_ui),
+    })
+    if portfolio_df is not None and ui_df is not None:
+        # show potential scaling issues
+        joined = ui_df.merge(portfolio_df[["isin", "qty_now"]], on="isin", how="inner", suffixes=("_ui", "_portfolio"))
+        joined["ratio"] = joined["qty_now_ui"] / joined["qty_now_portfolio"]
+        suspicious = joined[np.isclose(joined["ratio"], 10.0, atol=1e-6) | np.isclose(joined["ratio"], 0.1, atol=1e-6)]
+        if len(suspicious):
+            st.warning("Ik zie een mogelijke *x10* schaalverschil tussen UI export en Portfolio.csv voor sommige posities. Portfolio.csv wordt gebruikt als waarheid voor 'Aantal'.")
+            st.dataframe(suspicious[["isin", "qty_now_ui", "qty_now_portfolio", "ratio"]], use_container_width=True, hide_index=True)
+        else:
+            st.success("Geen duidelijke x10-schaalverschillen gedetecteerd (op overlap).")
+
+st.caption("v1.1: Voor een echte DEGIRO-match op 'Totale W/V' per positie is een UI/Tracky export ideaal, omdat dividend/tax FX-legs niet altijd per ISIN te alloceren zijn vanuit Account.csv alleen.")
